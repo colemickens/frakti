@@ -28,8 +28,12 @@ FRAKTI_VERSION="v1.1"
 CLUSTER_CIDR="10.244.0.0/16"
 MASTER_CIDR="10.244.1.0/24"
 
-install-hyperd-ubuntu() {
-    apt-get update && apt-get install -y gcc qemu qemu-kvm libvirt0 libvirt-bin
+install-hyperd() {
+    apt-get update 
+    until apt-get install -y gcc qemu qemu-kvm libvirt0 libvirt-bin ; do
+        echo "trying again later"
+        sleep 5
+    done
     curl -sSL https://hypercontainer.io/install | sed '/tput/d' | bash
     echo -e "Kernel=/var/lib/hyper/kernel\n\
 Initrd=/var/lib/hyper/hyper-initrd.img\n\
@@ -40,15 +44,9 @@ gRPCHost=127.0.0.1:22318" > /etc/hyper/config
     systemctl restart hyperd
 }
 
-install-docker-ubuntu() {
+install-docker() {
     curl -fsSL get.docker.com -o get-docker.sh
     sh get-docker.sh
-    systemctl start docker
-}
-
-install-docker-centos() {
-    yum install -y docker
-    systemctl enable docker
     systemctl start docker
 }
 
@@ -83,23 +81,7 @@ EOF
     systemctl start frakti
 }
 
-install-kubelet-centos() {
-    cat <<EOF > /etc/yum.repos.d/kubernetes.repo
-[kubernetes]
-name=Kubernetes
-baseurl=http://yum.kubernetes.io/repos/kubernetes-el7-x86_64
-enabled=1
-gpgcheck=1
-repo_gpgcheck=1
-gpgkey=https://packages.cloud.google.com/yum/doc/yum-key.gpg
-       https://packages.cloud.google.com/yum/doc/rpm-package-key.gpg
-EOF
-    setenforce 0
-    sed -i 's/SELINUX=enforcing/SELINUX=disabled/g' /etc/selinux/config
-    yum install -y kubernetes-cni kubelet kubeadm kubectl
-}
-
-install-kubelet-ubuntu() {
+install-kubelet() {
     apt-get update && apt-get install -y apt-transport-https
     curl -s https://packages.cloud.google.com/apt/doc/apt-key.gpg | apt-key add -
     cat <<EOF > /etc/apt/sources.list.d/kubernetes.list
@@ -113,16 +95,37 @@ EOF
 }
 
 install-cni() {
-    curl https://godeb.s3.amazonaws.com/godeb-amd64.tar.gz | tar xvzf -
-    ./godeb install
-    
     mkdir -p /opt/cni/bin
-    GOPATH=/gopath
-    mkdir -p $GOPATH/src/github.com/containernetworking/plugins
-    git clone https://github.com/containernetworking/plugins $GOPATH/src/github.com/containernetworking/plugins
-    (cd $GOPATH/src/github.com/containernetworking/plugins
-    ./build.sh
-    cp bin/* /opt/cni/bin/)
+    (
+        cd /opt/cni/bin
+        curl -sSL 'https://github.com/containernetworking/plugins/releases/download/v0.6.0/cni-plugins-amd64-v0.6.0.tgz' | tar xvzf -
+    )    
+}
+
+config-gce-kubeadm() {
+    EXTERNAL_IP=$(curl -s -H "Metadata-Flavor: Google" \
+    http://metadata.google.internal/computeMetadata/v1/instance/network-interfaces/0/access-configs/0/external-ip)
+    INTERNAL_IP=$(curl -s -H "Metadata-Flavor: Google" \
+    http://metadata.google.internal/computeMetadata/v1/instance/network-interfaces/0/ip)
+#    KUBERNETES_VERSION=$(curl -s -H "Metadata-Flavor: Google" \
+#    http://metadata.google.internal/computeMetadata/v1/instance/attributes/kubernetes-version)
+
+    cat <<EOF > kubeadm.conf
+kind: MasterConfiguration
+apiVersion: kubeadm.k8s.io/v1alpha1
+apiServerCertSANs:
+  - 10.96.0.1
+  - ${EXTERNAL_IP}
+  - ${INTERNAL_IP}
+apiServerExtraArgs:
+  admission-control: PodPreset,Initializers,GenericAdmissionWebhook,NamespaceLifecycle,LimitRanger,ServiceAccount,PersistentVolumeLabel,DefaultStorageClass,DefaultTolerationSeconds,NodeRestriction,ResourceQuota
+  feature-gates: AllAlpha=true
+  runtime-config: api/all
+cloudProvider: gce
+#kubernetesVersion: ${KUBERNETES_VERSION:-}
+networking:
+  podSubnet: ${CLUSTER_CIDR}
+EOF
 }
 
 config-kubelet() {
@@ -172,8 +175,9 @@ setup-master() {
     kubeadm reset
     config-cni # TODO: refactor better
 
-    kubeadm init --pod-network-cidr ${CLUSTER_CIDR} --kubernetes-version stable
-
+    #kubeadm init --pod-network-cidr ${CLUSTER_CIDR} --kubernetes-version stable
+    kubeadm init --config=kubeadm.conf
+    
     # Also enable schedule pods on the master for allinone.
     export KUBECONFIG=/etc/kubernetes/admin.conf
     chmod 0644 ${KUBECONFIG}
@@ -213,13 +217,13 @@ lsb_dist="$(echo "$lsb_dist" | tr '[:upper:]' '[:lower:]')"
 case "$lsb_dist" in
 
     ubuntu)
-        install-hyperd-ubuntu
-        install-docker-ubuntu
+        install-hyperd
+        install-docker
         install-frakti
-        install-kubelet-ubuntu
+        install-kubelet
         install-cni
         config-cni
-        #config-gce-kubeadm
+        config-gce-kubeadm
         config-kubelet
         setup-master
     ;;
@@ -229,29 +233,3 @@ case "$lsb_dist" in
     ;;
 
 esac
-
-config-gce-kubeadm() {
-    EXTERNAL_IP=$(curl -s -H "Metadata-Flavor: Google" \
-    http://metadata.google.internal/computeMetadata/v1/instance/network-interfaces/0/access-configs/0/external-ip)
-    INTERNAL_IP=$(curl -s -H "Metadata-Flavor: Google" \
-    http://metadata.google.internal/computeMetadata/v1/instance/network-interfaces/0/ip)
-    KUBERNETES_VERSION=$(curl -s -H "Metadata-Flavor: Google" \
-    http://metadata.google.internal/computeMetadata/v1/instance/attributes/kubernetes-version)
-
-    cat <<EOF > kubeadm.conf
-kind: MasterConfiguration
-apiVersion: kubeadm.k8s.io/v1alpha1
-apiServerCertSANs:
-  - 10.96.0.1
-  - ${EXTERNAL_IP}
-  - ${INTERNAL_IP}
-apiServerExtraArgs:
-  admission-control: PodPreset,Initializers,GenericAdmissionWebhook,NamespaceLifecycle,LimitRanger,ServiceAccount,PersistentVolumeLabel,DefaultStorageClass,DefaultTolerationSeconds,NodeRestriction,ResourceQuota
-  feature-gates: AllAlpha=true
-  runtime-config: api/all
-cloudProvider: gce
-kubernetesVersion: ${KUBERNETES_VERSION}
-networking:
-  podSubnet: 192.168.0.0/16
-EOF
-}
