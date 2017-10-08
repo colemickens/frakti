@@ -18,27 +18,22 @@ set -o errexit
 set -o nounset
 set -o pipefail
 
-FRAKTI_VERSION="v0.2"
+set -x
+
+if [ "${TMUX:-}" == "" ]; then
+    exec tmux new-session -d -s k8s "export HOME=/root; ${0}; /bin/bash"
+fi
+
+FRAKTI_VERSION="v1.1"
 CLUSTER_CIDR="10.244.0.0/16"
 MASTER_CIDR="10.244.1.0/24"
 
 install-hyperd-ubuntu() {
-    apt-get update && apt-get install -y qemu libvirt-bin
-    curl -sSL https://hypercontainer.io/install | bash
+    apt-get update && apt-get install -y gcc qemu qemu-kvm libvirt0 libvirt-bin
+    curl -sSL https://hypercontainer.io/install | sed '/tput/d' | bash
     echo -e "Kernel=/var/lib/hyper/kernel\n\
 Initrd=/var/lib/hyper/hyper-initrd.img\n\
-Hypervisor=qemu\n\
-StorageDriver=overlay\n\
-gRPCHost=127.0.0.1:22318" > /etc/hyper/config
-    systemctl enable hyperd
-    systemctl restart hyperd
-}
-
-install-hyperd-centos() {
-    curl -sSL https://hypercontainer.io/install | bash
-    echo -e "Kernel=/var/lib/hyper/kernel\n\
-Initrd=/var/lib/hyper/hyper-initrd.img\n\
-Hypervisor=qemu\n\
+Hypervisor=kvm\n\
 StorageDriver=overlay\n\
 gRPCHost=127.0.0.1:22318" > /etc/hyper/config
     systemctl enable hyperd
@@ -46,9 +41,8 @@ gRPCHost=127.0.0.1:22318" > /etc/hyper/config
 }
 
 install-docker-ubuntu() {
-    apt-get update
-    apt-get install -y docker.io
-    systemctl enable docker
+    curl -fsSL get.docker.com -o get-docker.sh
+    sh get-docker.sh
     systemctl start docker
 }
 
@@ -112,48 +106,83 @@ install-kubelet-ubuntu() {
 deb http://apt.kubernetes.io/ kubernetes-xenial main
 EOF
     apt-get update
-    apt-get install -y kubernetes-cni kubelet kubeadm kubectl
+    apt-get install -y kubelet kubeadm kubectl
+
+    echo "source <(kubectl completion bash)" >> /etc/bash.bashrc
+    echo "export KUBECONFIG=\"/etc/kubernetes/admin.conf\"" >> /etc/bash.bashrc
+}
+
+install-cni() {
+    curl https://godeb.s3.amazonaws.com/godeb-amd64.tar.gz | tar xvzf -
+    ./godeb install
+    
+    mkdir -p /opt/cni/bin
+    GOPATH=/gopath
+    mkdir -p $GOPATH/src/github.com/containernetworking/plugins
+    git clone https://github.com/containernetworking/plugins $GOPATH/src/github.com/containernetworking/plugins
+    (cd $GOPATH/src/github.com/containernetworking/plugins
+    ./build.sh
+    cp bin/* /opt/cni/bin/)
 }
 
 config-kubelet() {
-    sed -i '2 i\Environment="KUBELET_EXTRA_ARGS=--container-runtime=remote --container-runtime-endpoint=/var/run/frakti.sock --feature-gates=AllAlpha=true"' /etc/systemd/system/kubelet.service.d/10-kubeadm.conf
+    mkdir -p /etc/systemd/system/kubelet.service.d/
+    cat > /etc/systemd/system/kubelet.service.d/20-cri.conf <<EOF
+[Service]
+Environment="KUBELET_EXTRA_ARGS=--cgroup-driver=systemd --container-runtime=remote --container-runtime-endpoint=unix:///var/run/frakti.sock --feature-gates=AllAlpha=true"
+EOF
     systemctl daemon-reload
+    systemctl restart kubelet
 }
 
 config-cni() {
     mkdir -p /etc/cni/net.d
-    cat >/etc/cni/net.d/10-mynet.conf <<-EOF
+    cat >/etc/cni/net.d/10-mynet.conflist <<-EOF
 {
-    "cniVersion": "0.3.0",
+    "cniVersion": "0.3.1",
     "name": "mynet",
-    "type": "bridge",
-    "bridge": "cni0",
-    "isGateway": true,
-    "ipMasq": true,
-    "ipam": {
-        "type": "host-local",
-        "subnet": "${MASTER_CIDR}",
-        "routes": [
-            { "dst": "0.0.0.0/0"  }
-        ]
-    }
-}
-EOF
-    cat >/etc/cni/net.d/99-loopback.conf <<-EOF
-{
-    "cniVersion": "0.3.0",
-    "type": "loopback"
+    "plugins": [
+        {
+            "type": "bridge",
+            "bridge": "cni0",
+            "isGateway": true,
+            "ipMasq": true,
+            "ipam": {
+                "type": "host-local",
+                "subnet": "${MASTER_CIDR}",
+                "routes": [
+                    { "dst": "0.0.0.0/0"  }
+                ]
+            }
+        },
+        {
+            "type": "portmap",
+            "capabilities": {"portMappings": true},
+            "snat": true
+        },
+        {
+            "type": "loopback"
+        }
+    ]
 }
 EOF
 }
 
 setup-master() {
+    kubeadm reset
+    config-cni # TODO: refactor better
+
     kubeadm init --pod-network-cidr ${CLUSTER_CIDR} --kubernetes-version stable
+
     # Also enable schedule pods on the master for allinone.
     export KUBECONFIG=/etc/kubernetes/admin.conf
+    chmod 0644 ${KUBECONFIG}
     kubectl taint nodes --all node-role.kubernetes.io/master-
+
     # approve kublelet's csr for the node.
+    sleep 30
     kubectl certificate approve $(kubectl get csr | awk '/^csr/{print $1}')
+
     # increase memory limits for kube-dns
     kubectl -n kube-system patch deployment kube-dns -p '{"spec":{"template":{"spec":{"containers":[{"name":"kubedns","resources":{"limits":{"memory":"256Mi"}}},{"name":"dnsmasq","resources":{"limits":{"memory":"128Mi"}}},{"name":"sidecar","resources":{"limits":{"memory":"64Mi"}}}]}}}}'
 }
@@ -188,23 +217,41 @@ case "$lsb_dist" in
         install-docker-ubuntu
         install-frakti
         install-kubelet-ubuntu
+        install-cni
         config-cni
-        config-kubelet
-        setup-master
-    ;;
-
-    fedora|centos|redhat)
-        install-hyperd-centos
-        install-docker-centos
-        install-frakti
-        install-kubelet-centos
-        config-cni
+        #config-gce-kubeadm
         config-kubelet
         setup-master
     ;;
 
     *)
-        echo "$lsb_dist is not supported (not in centos|ubuntu)"
+        echo "$lsb_dist is not supported (not in ubuntu)"
     ;;
 
 esac
+
+config-gce-kubeadm() {
+    EXTERNAL_IP=$(curl -s -H "Metadata-Flavor: Google" \
+    http://metadata.google.internal/computeMetadata/v1/instance/network-interfaces/0/access-configs/0/external-ip)
+    INTERNAL_IP=$(curl -s -H "Metadata-Flavor: Google" \
+    http://metadata.google.internal/computeMetadata/v1/instance/network-interfaces/0/ip)
+    KUBERNETES_VERSION=$(curl -s -H "Metadata-Flavor: Google" \
+    http://metadata.google.internal/computeMetadata/v1/instance/attributes/kubernetes-version)
+
+    cat <<EOF > kubeadm.conf
+kind: MasterConfiguration
+apiVersion: kubeadm.k8s.io/v1alpha1
+apiServerCertSANs:
+  - 10.96.0.1
+  - ${EXTERNAL_IP}
+  - ${INTERNAL_IP}
+apiServerExtraArgs:
+  admission-control: PodPreset,Initializers,GenericAdmissionWebhook,NamespaceLifecycle,LimitRanger,ServiceAccount,PersistentVolumeLabel,DefaultStorageClass,DefaultTolerationSeconds,NodeRestriction,ResourceQuota
+  feature-gates: AllAlpha=true
+  runtime-config: api/all
+cloudProvider: gce
+kubernetesVersion: ${KUBERNETES_VERSION}
+networking:
+  podSubnet: 192.168.0.0/16
+EOF
+}
